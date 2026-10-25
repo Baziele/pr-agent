@@ -592,6 +592,34 @@ class LiteLLMAIHandler(BaseAiHandler):
             model.strip() for model in additional_reasoning_models
         ]
 
+        # Models that must use the OpenAI Responses API instead of chat-completions.
+        # Mirrors additional_reasoning_effort_models: an operator escape hatch for endpoints
+        # litellm does not know, matched exactly or through any provider prefix (see
+        # _is_responses_model). Env-style strings are accepted like the lists above.
+        responses_models = _coerce_string_list_config(
+            get_settings().config.get("responses_models", [])
+        )
+        if responses_models is None:
+            get_logger().warning(
+                "Invalid responses_models in config; expected a list of model names. "
+                "Ignoring it."
+            )
+            responses_models = []
+        elif responses_models and not all(
+            isinstance(model, str) and model.strip() for model in responses_models
+        ):
+            get_logger().warning(
+                "Invalid responses_models in config; "
+                "expected a list of model name strings. "
+                "Ignoring it."
+            )
+            responses_models = []
+        # Store stripped names so exact-match checks against the model succeed even when the
+        # config entries contain surrounding whitespace (validation above already used strip()).
+        self.responses_models = [
+            model.strip() for model in responses_models
+        ]
+
         # Models that support extended thinking (config override replaces the built-in list when non-empty)
         override = self._validated_model_name_list("claude_extended_thinking_models_override")
         self.claude_extended_thinking_models = override or CLAUDE_EXTENDED_THINKING_MODELS
@@ -2434,6 +2462,210 @@ class LiteLLMAIHandler(BaseAiHandler):
             for registered_model in self.user_message_only_models
         )
 
+    def _is_responses_model(self, model: str) -> bool:
+        """Return whether a model must use the OpenAI Responses API.
+
+        Matches config.responses_models exactly or through any provider prefix,
+        mirroring additional_reasoning_effort_models. OpenRouter routing suffixes
+        (:nitro/:floor) are ignored for matching; the model keeps its routed id
+        for the actual request.
+        """
+        responses_models = getattr(self, "responses_models", [])
+        if not responses_models or not isinstance(model, str):
+            return False
+        candidate = model.rsplit(":", 1)[0] if model.startswith("openrouter/") else model
+        return any(
+            candidate == registered_model or candidate.endswith("/" + registered_model)
+            for registered_model in responses_models
+        )
+
+    @staticmethod
+    def _extract_responses_text(response) -> str:
+        """Extract the text output from a Responses API response object.
+
+        Prefers the SDK's flattened output_text, falling back to parsing message
+        items so Responses-shaped dicts (tests, gateways) extract identically.
+        Reasoning items are skipped: only message content counts as the answer.
+        """
+        flat_text = getattr(response, "output_text", None)
+        if isinstance(flat_text, str) and flat_text.strip():
+            return flat_text
+        if isinstance(response, dict):
+            flat_text = response.get("output_text")
+            if isinstance(flat_text, str) and flat_text.strip():
+                return flat_text
+        output = _response_field(response, "output") or []
+        parts = []
+        for item in output:
+            item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+            if item_type != "message":
+                continue
+            content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+            for block in content or []:
+                block_type = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+                if block_type not in ("output_text", "text"):
+                    continue
+                text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        return "".join(parts)
+
+    @staticmethod
+    def _responses_finish_reason(response) -> str:
+        """Map a Responses API status to the chat-completion finish_reason contract.
+
+        Completed responses stop normally. An incomplete response that exhausted
+        the output budget maps to "length" so the handler's truncation retry
+        policy (EmptyTruncatedResponseError -> fallback models) applies unchanged.
+        """
+        if _response_field(response, "status") == "incomplete":
+            details = _response_field(response, "incomplete_details")
+            reason = (
+                details.get("reason") if isinstance(details, dict)
+                else getattr(details, "reason", None)
+            )
+            if reason == "max_output_tokens":
+                return "length"
+        return "stop"
+
+    def _responses_extra_headers(self, kwargs: dict) -> dict:
+        """Merge request headers into Responses-safe extra_headers.
+
+        The chat path resolves SDK header markers (organization/project omission
+        sentinels) inside _acompletion's header bridge; direct aresponses calls
+        bypass that bridge, so internal sentinels must not reach the wire. Drop
+        non-string values (they are omission markers, and omission is dropping),
+        then restore configured org/project/custom headers as real strings.
+        """
+        headers = dict(kwargs.get("extra_headers") or {})
+        for name, value in (kwargs.get("headers") or {}).items():
+            if not any(existing.lower() == name.lower() for existing in headers):
+                headers[name] = value
+        sdk_defaults = getattr(self, "_sdk_header_defaults", None) or {}
+        cleaned_headers = {
+            name: value for name, value in headers.items()
+            if isinstance(value, (str, bytes))
+        }
+        for header_name, configured in (
+            ("OpenAI-Organization", sdk_defaults.get("organization")),
+            ("OpenAI-Project", sdk_defaults.get("project")),
+        ):
+            if (
+                isinstance(configured, str) and configured
+                and not any(name.lower() == header_name.lower() for name in cleaned_headers)
+            ):
+                cleaned_headers[header_name] = configured
+        for name, value in (sdk_defaults.get("custom_headers") or {}).items():
+            if isinstance(value, (str, bytes)) and not any(
+                existing.lower() == name.lower() for existing in cleaned_headers
+            ):
+                cleaned_headers[name] = value
+        return cleaned_headers
+
+    def _build_responses_kwargs(self, model: str, system: str, user: str, kwargs: dict) -> dict:
+        """Translate chat-completion request kwargs into a Responses API call.
+
+        Only text prompts cross over: image inputs stay on the chat path, so a
+        Responses-model image request is reviewed text-only with a warning.
+        Temperature rides along unless blocked by custom_reasoning_model or
+        no_temperature_models (the litellm capability probe is bypassed: it
+        fails closed for endpoint-specific models this list exists for).
+        config.reasoning_effort is always sent as the Responses reasoning effort.
+        """
+        if kwargs.get("stream"):
+            get_logger().info(
+                f"Streaming is not used for Responses API model {model}; sending non-streaming request"
+            )
+        resp_kwargs = {
+            "model": model,
+            "instructions": system or None,
+            "input": user,
+            "timeout": kwargs.get("timeout"),
+        }
+        for key in ("api_key", "api_base", "custom_llm_provider", "extra_body", "user"):
+            if kwargs.get(key) is not None:
+                resp_kwargs[key] = kwargs[key]
+        for key in ("num_retries", "max_retries"):
+            if kwargs.get(key) is not None:
+                resp_kwargs[key] = kwargs[key]
+        headers = self._responses_extra_headers(kwargs)
+        if headers:
+            resp_kwargs["extra_headers"] = headers
+        if (
+            "temperature" in kwargs
+            or (
+                not get_settings().config.custom_reasoning_model
+                and not self._model_uses_adaptive_thinking(model)
+                and not any(
+                    model == blocked or model.endswith("/" + blocked)
+                    for blocked in self.no_temperature_models
+                )
+            )
+        ):
+            resp_kwargs.setdefault("temperature", kwargs.get(
+                "temperature", get_settings().config.get("temperature", 0.2)))
+        resp_kwargs["reasoning"] = {
+            "effort": self._validate_reasoning_effort(self._default_reasoning_effort)
+        }
+        output_limit = (
+            kwargs.get("max_completion_tokens") or kwargs.get("max_tokens") or 0
+        )
+        try:
+            output_limit = int(output_limit)
+        except (TypeError, ValueError, OverflowError):
+            output_limit = 0
+        resp_kwargs["max_output_tokens"] = output_limit if output_limit > 0 else 8192
+        return resp_kwargs
+
+    async def _get_responses_completion(self, *, _stream_cleanup=None, **kwargs):
+        """Serve a Responses-listed model through litellm.aresponses.
+
+        Returns the same (content, finish_reason, response) triple as the chat
+        path so retry, logging, and cost bookkeeping apply unchanged.
+        """
+        model = kwargs.get("model", "")
+        messages = kwargs.get("messages") or []
+        system_parts, user_parts = [], []
+        for message in messages:
+            role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+            if isinstance(content, list):
+                get_logger().warning(
+                    f"Image inputs are reviewed text-only for Responses API model {model}"
+                )
+                content = " ".join(
+                    block.get("text", "") for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            if role == "system":
+                system_parts.append(content or "")
+            else:
+                user_parts.append(content or "")
+        resp_kwargs = self._build_responses_kwargs(
+            model, "\n".join(system_parts), "\n\n".join(user_parts), kwargs)
+        if resp_kwargs.get("instructions") is None:
+            resp_kwargs.pop("instructions", None)
+        response = await litellm.aresponses(**resp_kwargs)
+        content = self._extract_responses_text(response)
+        finish_reason = self._responses_finish_reason(response)
+        if not content or (isinstance(content, str) and content.isspace()):
+            get_logger().warning(
+                f"Empty content in model response, finish_reason: {finish_reason}")
+            error_message = f"Empty content in model response (finish_reason: {finish_reason})"
+            error_request = httpx.Request("POST", model)
+            if finish_reason == "length":
+                raise EmptyTruncatedResponseError(
+                    error_message,
+                    request=error_request,
+                    body=None,
+                )
+            raise openai.APIError(
+                error_message,
+                request=error_request,
+                body=None,
+            )
+        return content, finish_reason, response
+
     def _configure_claude_extended_thinking(self, model: str, kwargs: dict) -> dict:
         """
         Configure Claude extended thinking parameters if applicable.
@@ -3031,9 +3263,15 @@ class LiteLLMAIHandler(BaseAiHandler):
                         for no_temp_model in self.no_temperature_models
                     )
                     and not self._model_uses_adaptive_thinking(model)
-                    and self._litellm_supports_temperature(
-                        capability_model,
-                        request_provider or custom_llm_provider or None,
+                    and (
+                        self._litellm_supports_temperature(
+                            capability_model,
+                            request_provider or custom_llm_provider or None,
+                        )
+                        # Responses-listed models bypass the capability probe: it fails
+                        # closed for endpoint-specific models this list exists for, and
+                        # the endpoint accepts temperature (verified for Muse).
+                        or self._is_responses_model(model)
                     )
                 ):
                     # get_logger().info(f"Adding temperature with value {temperature} to model {model}.")
@@ -3347,6 +3585,27 @@ class LiteLLMAIHandler(BaseAiHandler):
                 kwargs["stream"] = True
                 kwargs["stream_options"] = {"include_usage": True}
             kwargs["model"] = normalize_litellm_model(kwargs["model"], custom_llm_provider)
+            if self._is_responses_model(kwargs["model"]):
+                # Health probe over the Responses API: same credentials and
+                # headers, minimal prompt. A successful call returns quietly.
+                probe_headers = self._responses_extra_headers(kwargs)
+                probe_kwargs = {
+                    "model": kwargs["model"],
+                    "instructions": "Say ping",
+                    "input": "ping",
+                    "max_output_tokens": max(max_tokens, MIN_MAX_OUTPUT_TOKENS),
+                    "timeout": timeout,
+                    "reasoning": {
+                        "effort": self._validate_reasoning_effort(self._default_reasoning_effort)
+                    },
+                }
+                for key in ("api_key", "api_base", "custom_llm_provider"):
+                    if kwargs.get(key) is not None:
+                        probe_kwargs[key] = kwargs[key]
+                if probe_headers:
+                    probe_kwargs["extra_headers"] = probe_headers
+                await litellm.aresponses(**probe_kwargs)
+                return
             response = await self._acompletion(_completion=_completion, **kwargs)
             if streaming or hasattr(response, "__aiter__"):
                 try:
@@ -3364,6 +3623,11 @@ class LiteLLMAIHandler(BaseAiHandler):
         """
         model = kwargs["model"]
         custom_llm_provider = str(kwargs.get("custom_llm_provider") or "").strip().lower()
+        # Responses-listed models (config.responses_models) speak the Responses API,
+        # which litellm exposes as aresponses rather than acompletion. Branch here so
+        # every caller of this wrapper inherits the transport with no tool changes.
+        if self._is_responses_model(model):
+            return await self._get_responses_completion(_stream_cleanup=_stream_cleanup, **kwargs)
         # Double the prefix so LiteLLM strips its provider prefix but preserves
         # OpenRouter's native router ID; leave other explicit providers unchanged.
         kwargs["model"] = normalize_litellm_model(model, custom_llm_provider)
