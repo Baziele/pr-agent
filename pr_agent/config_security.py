@@ -53,9 +53,6 @@ REPO_HOST_ONLY_KEYS_BY_SECTION = {
     # Jira lookups use the host's Atlassian credentials, so the reviewed repository must not
     # choose the site or account they authenticate as, or widen the project allowlist they may read.
     "jira": frozenset({"cloud_id", "jira_api_email", "jira_site", "project_keys"}),
-    # extra_headers is attached to every model request, so on a shared gateway that routes or
-    # authenticates by header the reviewed repository must not choose the headers the operator sends.
-    "litellm": frozenset({"extra_headers"}),
     "moonshot": frozenset({"api_base"}),
     "ollama": frozenset({"api_base"}),
     "openai": frozenset({"api_base", "api_type", "api_version"}),
@@ -136,7 +133,12 @@ def should_skip_config_key(section: str, key: str, skip_keys=()) -> bool:
 # GitHub Action. The runner reads it after the command has applied its arguments, so a comment
 # such as `/review --github_action_config.fail_on_tool_errors=false` could turn a failed review
 # into a green workflow; the workflow's operator sets it instead.
+# Fork note: litellm.extra_headers lives here (not in REPO_HOST_ONLY_KEYS_BY_SECTION) so a
+# repository's own root .pr_agent.toml may choose request headers for its self-hosted gateway
+# (e.g. opencode Go's x-opencode-session), while PR comment arguments still cannot: any
+# commenter could supply those, but only maintainers edit the default-branch settings file.
 CLI_HOST_ONLY_KEYS_BY_SECTION = {
+    "litellm": frozenset({"extra_headers"}),
     "config": frozenset({
         "branch_issue_regex",
         "fallback_models",

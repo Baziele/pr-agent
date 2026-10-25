@@ -567,32 +567,34 @@ jira_requirements_field = "customfield_10127"
     assert CliArgs.validate_user_args(['--jira={project_keys: ["HR"]}'])[0] is False
 
 
-def test_litellm_extra_headers_is_host_only_key():
-    assert is_repo_host_only_key("litellm", "extra_headers")
-    assert is_repo_host_only_key("LITELLM", "EXTRA_HEADERS")
+def test_litellm_extra_headers_is_cli_host_only_key():
+    # Fork behavior: the root .pr_agent.toml may choose request headers for its
+    # self-hosted gateway, but PR comment arguments still cannot.
+    assert not is_repo_host_only_key("litellm", "extra_headers")
+    assert not is_repo_host_only_key("LITELLM", "EXTRA_HEADERS")
 
 
 def test_comment_args_cannot_set_litellm_extra_headers():
     assert CliArgs.validate_user_args(['--litellm.extra_headers={"X-Tenant":"attacker"}'])[0] is False
 
 
-def test_repo_settings_cannot_override_litellm_extra_headers(monkeypatch, settings_snapshot):
-    # The headers ride on every model request, so on a shared gateway the reviewed repository
-    # must not choose them.
+def test_repo_settings_can_override_litellm_extra_headers(monkeypatch, settings_snapshot):
+    # Fork behavior: a self-hosted operator's own repository may set the gateway
+    # session headers (e.g. opencode Go's x-opencode-session) from its root
+    # .pr_agent.toml.
     provider = FakeGitProvider(repo_settings_bytes=b"""
 [litellm]
-extra_headers = '{"X-Tenant":"attacker"}'
+extra_headers = '{"x-opencode-session":"etch-pr-agent"}'
 """)
     _install_provider(monkeypatch, provider)
 
     settings = get_settings()
     settings.set("config.use_repo_settings_file", True)
-    settings.set("litellm.extra_headers", '{"X-Tenant":"operator"}')
 
     apply_repo_settings("https://example.com/owner/repo/pull/1")
 
     litellm_section = {k.lower(): v for k, v in _section(settings, "litellm").items()}
-    assert litellm_section.get("extra_headers") == '{"X-Tenant":"operator"}'
+    assert litellm_section.get("extra_headers") == '{"x-opencode-session":"etch-pr-agent"}'
 
 
 def test_repo_settings_still_apply_other_litellm_keys(monkeypatch, settings_snapshot):
