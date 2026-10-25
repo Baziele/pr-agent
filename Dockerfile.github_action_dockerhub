@@ -1,1 +1,21 @@
-FROM pragent/pr-agent:github_action
+# Fork build: compile this repo's code into the Action image instead of
+# pulling upstream's prebuilt runtime (which would ignore fork patches).
+FROM python:3.14.9-slim@sha256:b347e2dcbc7f0b6f9fb7182e9da6a187fb10ae715e0692518c1aed0eec94a700
+COPY --from=ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff /uv /uvx /bin/
+
+ENV LITELLM_LOCAL_MODEL_COST_MAP=True
+
+RUN apt-get update && apt-get install --no-install-recommends -y git curl && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+ENV UV_COMPILE_BYTECODE=1
+COPY pyproject.toml uv.lock ./
+COPY docs docs
+RUN uv sync --frozen --no-install-project --no-dev --extra all
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH=/app
+
+COPY pr_agent pr_agent
+COPY github_action/entrypoint.sh /
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
